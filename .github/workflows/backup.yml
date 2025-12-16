@@ -1,0 +1,180 @@
+name: Backup Secrets to Arweave
+
+on:
+  schedule:
+    # Run daily at 3 AM UTC
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to backup'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+          - development
+
+env:
+  INFISICAL_API_URL: https://secrets.alternatefutures.ai/api
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          npm install -g @anthropic-ai/turbo-sdk
+          sudo apt-get update
+          sudo apt-get install -y age
+
+      - name: Get access token from Infisical
+        id: auth
+        run: |
+          # Get access token using machine identity
+          TOKEN_RESPONSE=$(curl -s -X POST "${{ env.INFISICAL_API_URL }}/v1/auth/universal-auth/login" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "clientId": "${{ secrets.INFISICAL_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.INFISICAL_CLIENT_SECRET }}"
+            }')
+
+          ACCESS_TOKEN=$(echo $TOKEN_RESPONSE | jq -r '.accessToken')
+
+          if [ "$ACCESS_TOKEN" = "null" ] || [ -z "$ACCESS_TOKEN" ]; then
+            echo "Failed to get access token"
+            echo $TOKEN_RESPONSE
+            exit 1
+          fi
+
+          echo "::add-mask::$ACCESS_TOKEN"
+          echo "access_token=$ACCESS_TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Export secrets from all folders
+        env:
+          ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          ENVIRONMENT: ${{ inputs.environment || 'production' }}
+        run: |
+          mkdir -p backups
+
+          # List of secret paths to backup
+          PATHS=(
+            "/"
+            "/shared"
+            "/service-cloud-api"
+            "/service-auth"
+            "/web-app"
+            "/infrastructure-proxy"
+            "/akash"
+          )
+
+          for PATH in "${PATHS[@]}"; do
+            echo "Exporting secrets from $PATH..."
+
+            SAFE_PATH=$(echo "$PATH" | sed 's/\//_/g')
+
+            RESPONSE=$(curl -s -X GET "${{ env.INFISICAL_API_URL }}/v3/secrets/raw?workspaceId=${{ secrets.INFISICAL_PROJECT_ID }}&environment=$ENVIRONMENT&secretPath=$PATH" \
+              -H "Authorization: Bearer $ACCESS_TOKEN")
+
+            # Check if we got secrets
+            COUNT=$(echo $RESPONSE | jq '.secrets | length // 0')
+
+            if [ "$COUNT" -gt 0 ]; then
+              echo "$RESPONSE" | jq '.secrets' > "backups/secrets${SAFE_PATH}.json"
+              echo "  Exported $COUNT secrets from $PATH"
+            else
+              echo "  No secrets found in $PATH (or path doesn't exist)"
+            fi
+          done
+
+          # Create combined backup with metadata
+          cat > backups/metadata.json << EOF
+          {
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "environment": "$ENVIRONMENT",
+            "project_id": "${{ secrets.INFISICAL_PROJECT_ID }}",
+            "backup_version": "1.0"
+          }
+          EOF
+
+          # Create tarball
+          tar -czf backup-${{ github.run_id }}.tar.gz backups/
+
+          echo "backup_file=backup-${{ github.run_id }}.tar.gz" >> $GITHUB_ENV
+
+      - name: Encrypt backup with age
+        env:
+          AGE_PUBLIC_KEY: ${{ secrets.AGE_PUBLIC_KEY }}
+        run: |
+          # Encrypt the backup tarball
+          echo "$AGE_PUBLIC_KEY" > age-recipient.txt
+          age -R age-recipient.txt -o backup-${{ github.run_id }}.tar.gz.age backup-${{ github.run_id }}.tar.gz
+
+          # Verify encryption
+          ls -la backup-${{ github.run_id }}.tar.gz.age
+
+          # Remove unencrypted file
+          rm backup-${{ github.run_id }}.tar.gz
+          rm -rf backups/
+
+      - name: Upload to Arweave
+        env:
+          TURBO_WALLET: ${{ secrets.ARWEAVE_WALLET_JWK }}
+        run: |
+          # Write wallet to temp file
+          echo "$TURBO_WALLET" > /tmp/wallet.json
+
+          # Upload using turbo-sdk CLI
+          RESULT=$(npx @anthropic-ai/turbo-sdk upload \
+            --file backup-${{ github.run_id }}.tar.gz.age \
+            --wallet /tmp/wallet.json \
+            --tags "app:alternatefutures" "type:secrets-backup" "env:${{ inputs.environment || 'production' }}" "date:$(date +%Y-%m-%d)" \
+            2>&1) || true
+
+          echo "$RESULT"
+
+          # Extract transaction ID
+          TX_ID=$(echo "$RESULT" | grep -oE 'ar://[a-zA-Z0-9_-]+' | head -1 || echo "")
+
+          if [ -n "$TX_ID" ]; then
+            echo "Backup uploaded to Arweave: $TX_ID"
+            echo "arweave_tx=$TX_ID" >> $GITHUB_ENV
+          else
+            echo "Warning: Could not extract Arweave transaction ID"
+            echo "Backup file available as artifact"
+          fi
+
+          # Clean up wallet
+          rm /tmp/wallet.json
+
+      - name: Upload backup as artifact (fallback)
+        uses: actions/upload-artifact@v4
+        with:
+          name: secrets-backup-${{ github.run_id }}
+          path: backup-${{ github.run_id }}.tar.gz.age
+          retention-days: 30
+
+      - name: Update backup log
+        if: env.arweave_tx != ''
+        run: |
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) | ${{ inputs.environment || 'production' }} | ${{ env.arweave_tx }}" >> backup-log.txt
+
+          # This would ideally commit to the repo or store in Infisical
+          echo "Backup logged: ${{ env.arweave_tx }}"
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "Backup failed! Check the workflow logs."
+          # Could add Slack/Discord notification here
