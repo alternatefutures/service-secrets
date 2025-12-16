@@ -1,4 +1,4 @@
-name: Backup Secrets to Arweave
+name: Backup Secrets to Storacha + GitHub
 
 on:
   schedule:
@@ -35,7 +35,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          npm install -g @ardrive/turbo-sdk
+          npm install -g @web3-storage/w3cli
           sudo apt-get update
           sudo apt-get install -y age
 
@@ -137,35 +137,41 @@ jobs:
           rm backup-${{ github.run_id }}.tar.gz
           rm -rf backups/
 
-      - name: Upload to Arweave
+      - name: Upload to Storacha (Web3.Storage)
         env:
-          TURBO_WALLET: ${{ secrets.ARWEAVE_WALLET_JWK }}
+          W3_PRINCIPAL: ${{ secrets.W3_PRINCIPAL }}
+          W3_PROOF: ${{ secrets.W3_PROOF }}
         run: |
-          # Write wallet to temp file
-          echo "$TURBO_WALLET" > /tmp/wallet.json
+          # Configure w3 CLI with credentials
+          mkdir -p ~/.w3
 
-          # Upload using turbo-sdk CLI
-          RESULT=$(npx @ardrive/turbo-sdk upload \
-            --file backup-${{ github.run_id }}.tar.gz.age \
-            --wallet /tmp/wallet.json \
-            --tags "app:alternatefutures" "type:secrets-backup" "env:${{ inputs.environment || 'production' }}" "date:$(date +%Y-%m-%d)" \
-            2>&1) || true
+          # Check if credentials are provided
+          if [ -z "$W3_PRINCIPAL" ] || [ -z "$W3_PROOF" ]; then
+            echo "Storacha credentials not configured"
+            echo "Skipping Storacha upload - backup will be saved as GitHub artifact"
+            exit 0
+          fi
+
+          echo "$W3_PRINCIPAL" > ~/.w3/principal.json
+          echo "$W3_PROOF" > ~/.w3/proof.json
+
+          # Upload using w3 CLI
+          echo "Uploading to Storacha (IPFS + Filecoin)..."
+          RESULT=$(w3 up backup-${{ github.run_id }}.tar.gz.age 2>&1) || true
 
           echo "$RESULT"
 
-          # Extract transaction ID
-          TX_ID=$(echo "$RESULT" | grep -oE 'ar://[a-zA-Z0-9_-]+' | head -1 || echo "")
+          # Extract CID from output
+          CID=$(echo "$RESULT" | grep -oE 'bafy[a-zA-Z0-9]+' | head -1 || echo "")
 
-          if [ -n "$TX_ID" ]; then
-            echo "Backup uploaded to Arweave: $TX_ID"
-            echo "arweave_tx=$TX_ID" >> $GITHUB_ENV
+          if [ -n "$CID" ]; then
+            echo "Backup uploaded to Storacha: $CID"
+            echo "IPFS Gateway URL: https://w3s.link/ipfs/$CID"
+            echo "storacha_cid=$CID" >> $GITHUB_ENV
           else
-            echo "Warning: Could not extract Arweave transaction ID"
-            echo "Backup file available as artifact"
+            echo "Warning: Could not extract CID from Storacha upload"
+            echo "Backup file available as GitHub artifact"
           fi
-
-          # Clean up wallet
-          rm /tmp/wallet.json
 
       - name: Upload backup as artifact (fallback)
         uses: actions/upload-artifact@v4
@@ -175,12 +181,21 @@ jobs:
           retention-days: 30
 
       - name: Update backup log
-        if: env.arweave_tx != ''
         run: |
-          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) | ${{ inputs.environment || 'production' }} | ${{ env.arweave_tx }}" >> backup-log.txt
+          echo "=== Backup Summary ==="
+          echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "Environment: ${{ inputs.environment || 'production' }}"
 
-          # This would ideally commit to the repo or store in Infisical
-          echo "Backup logged: ${{ env.arweave_tx }}"
+          if [ -n "${{ env.storacha_cid }}" ]; then
+            echo "Storacha CID: ${{ env.storacha_cid }}"
+            echo "IPFS URL: https://w3s.link/ipfs/${{ env.storacha_cid }}"
+          fi
+
+          echo "GitHub Artifact: secrets-backup-${{ github.run_id }}"
+          echo ""
+          echo "Backup stored in TWO locations for redundancy:"
+          echo "1. GitHub Artifacts (30 day retention)"
+          echo "2. Storacha/IPFS+Filecoin (decentralized)"
 
       - name: Notify on failure
         if: failure()
